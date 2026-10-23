@@ -22,11 +22,25 @@
   button:hover{border-color:#1d2326}
   button[aria-pressed="true"]{background:#1d2326;color:#fff;border-color:#1d2326}
   #corner{position:fixed;right:16px;bottom:16px;z-index:2}
-  body:not([data-screen="home"]) #makeBtn,body:not([data-screen="mine"]) #editBtn{display:none}
+  body:not([data-screen="mine"]) #corner{display:none}
   body[data-screen="make"] #bar,body[data-screen="make"] #dens,body[data-screen="make"] #corner{display:none}
   @media (max-width:760px){#bar{right:16px;bottom:54px}}
   :fullscreen #bar,:fullscreen #dens,:fullscreen #top,:fullscreen #corner{display:none}
   :fullscreen #stage{top:0}
+
+  /* 떠다니는 물방울 — 누르면 작품 설명 */
+  #drops{position:fixed;left:0;top:40px;width:100%;height:calc(100% - 40px);z-index:1;pointer-events:none}
+  #dropHit{position:fixed;z-index:2;border-radius:50%;cursor:pointer;background:none;border:0;padding:0}
+  #dropHit:hover{border:0}
+  #dropHit[hidden],#about[hidden]{display:none}
+  body:not([data-screen="home"]) #drops,:fullscreen #drops,:fullscreen #dropHit{display:none}
+  #about{position:fixed;inset:0;z-index:5}
+  #about .card{position:absolute;width:min(250px,calc(100vw - 32px));box-sizing:border-box;background:#fff;border:1px solid #e4e8ea;padding:20px 14px 14px;
+               display:flex;flex-direction:column;align-items:flex-start;gap:10px;font:400 11px/1.55 ui-monospace,Menlo,monospace;color:#1d2326}
+  #about .card:focus{outline:none}
+  #about p{margin:0}
+  #about .by{color:#5b6569}
+  #aboutClose{position:absolute;top:2px;right:2px;border:0;padding:5px 7px;font-size:12px}
 
   /* 나만의 지층 만들기 화면 */
   #make{position:fixed;inset:40px 0 0 0;background:#fff;overflow:auto;z-index:3;font:400 11px/1.6 ui-monospace,Menlo,monospace;color:#1d2326}
@@ -71,8 +85,17 @@
 </div>
 </div>
 <div id="corner">
-  <button id="makeBtn">Make your own</button>
   <button id="editBtn">Edit layers</button>
+</div>
+<canvas id="drops"></canvas>
+<button id="dropHit" hidden aria-label="About this work"></button>
+<div id="about" hidden role="dialog" aria-modal="true" aria-label="About this work">
+  <div class="card" tabindex="-1">
+    <button id="aboutClose" aria-label="Close">×</button>
+    <p>Eight rounds of deep rest in a sauna, each drawn by hand. The drawings are rendered as dots by colour and stacked with gaps equal to the time each round took. The image shifts with the angle and density from which it is seen.</p>
+    <p class="by">Seonrin Kim</p>
+    <button id="makeBtn">Make your own</button>
+  </div>
 </div>
 
 <section id="make" hidden>
@@ -554,8 +577,139 @@ confirmBtn.addEventListener('click', () => {
   mine = { sources: items.map(sourceOf), zs: z.map(v => v - mid), labels: items.map((_, i) => String(i + 1)), file: 'my-strata.png' };
   location.hash = 'mine';
 });
-document.getElementById('makeBtn').addEventListener('click', () => { location.hash = 'make'; });
+document.getElementById('makeBtn').addEventListener('click', () => { closeAbout(); location.hash = 'make'; });
 document.getElementById('editBtn').addEventListener('click', () => { location.hash = 'make'; });
+
+/* ============================================================
+   물방울 — 투명한 몸에 검은 테두리. 아무 데서나 생겨 3초 동안 아무 방향으로 흘러가다 멈추고,
+   테두리를 이루던 점들이 3초 동안 바깥으로 흩어지며 사라짐. 그리고 다른 자리에서 다시.
+   누르면 작품 설명이 뜸.
+   ============================================================ */
+const DROP = {
+  size: [8, 12],        // 물방울 반지름 범위 (px) — 손톱만 한 크기
+  speed: [60, 90],      // 흘러가는 속도 범위 (px/초) — 처음부터 끝까지 같은 속도
+  wander: 1.4,          // 방향이 얼마나 자유롭게 휘는지 (라디안) — 0 이면 일직선
+  appear: 0.5, move: 3, hold: 0, scatter: 3, rest: 0.8,   // 단계별 시간 (초)
+  spread: [12, 50],     // 흩어지는 점이 날아가는 거리 범위 (px)
+  dotGap: 2.6,          // 테두리를 이루는 점 사이 거리 (px)
+  dotSize: 0.8,         // 점 반지름 (px)
+  margin: [56, 56, 150, 56]  // 물방울이 생길 수 있는 영역의 위·오른쪽·아래·왼쪽 여백 — 버튼과 겹치지 않게
+};
+const dropCv = document.getElementById('drops'), dctx = dropCv.getContext('2d');
+const dropHit = document.getElementById('dropHit'), about = document.getElementById('about');
+let bubble = null, dropW = 0, dropH = 0;
+const rand = (a, b) => a + Math.random() * (b - a);
+
+function sizeDrops() {
+  const dpr = Math.min(devicePixelRatio, 2);
+  dropW = dropCv.clientWidth; dropH = dropCv.clientHeight;
+  dropCv.width = dropW * dpr; dropCv.height = dropH * dpr;
+  dctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+/* 3D 점과 같은 물방울 모양 — 몇 개의 굴곡을 겹치고 한쪽에 살짝 꼬리, 움직이는 동안 천천히 일렁임 */
+function spawnDrop(now) {
+  const [mt, mr, mb, ml] = DROP.margin;
+  /* 흘러갈 길을 미리 그림 — 같은 속도로, 방향은 두 개의 느린 물결을 겹쳐 이리저리 휘고, 영역 끝에 닿으면 안쪽으로 방향을 틂 */
+  let x = rand(ml, dropW - mr), y = rand(mt, dropH - mb), base = rand(0, Math.PI * 2);
+  const v = rand(...DROP.speed), dt = 1 / 60, path = [[x, y]];
+  const turns = [0, 1].map(() => ({ w: rand(0.6, 2.2) * (Math.random() < .5 ? -1 : 1), p: rand(0, Math.PI * 2) }));
+  for (let t = dt; t <= DROP.move + 1e-6; t += dt) {
+    const bend = DROP.wander * turns.reduce((s, q) => s + Math.sin(q.w * t + q.p), 0) / 2;
+    let a = base + bend, nx = x + Math.cos(a) * v * dt, ny = y + Math.sin(a) * v * dt;
+    if (nx < ml || nx > dropW - mr || ny < mt || ny > dropH - mb) {
+      base = Math.atan2((mt + dropH - mb) / 2 - y, (ml + dropW - mr) / 2 - x) - bend;   // 영역 가운데 쪽으로
+      a = base + bend; nx = x + Math.cos(a) * v * dt; ny = y + Math.sin(a) * v * dt;
+    }
+    x = nx; y = ny;
+    path.push([x, y]);
+  }
+  bubble = { path, t0: now, r: rand(...DROP.size), tail: rand(0, Math.PI * 2), turn: rand(-0.4, 0.4),
+           waves: [2, 3, 4].map(n => ({ n, a: rand(0.03, 0.09), p: rand(0, Math.PI * 2), s: rand(-0.8, 0.8) })), dots: null };
+}
+function outline(d, cx, cy, t) {
+  const pts = [];
+  for (let i = 0; i < 120; i++) {
+    const th = i / 120 * Math.PI * 2;
+    let k = 1 + 0.2 * Math.pow(Math.max(0, Math.cos(th - d.tail - d.turn * t)), 6);
+    d.waves.forEach(w => { k += w.a * Math.sin(w.n * th + w.p + w.s * t); });
+    pts.push([cx + Math.cos(th) * d.r * k, cy + Math.sin(th) * d.r * k]);
+  }
+  return pts;
+}
+/* 테두리를 dotGap 마다 점으로 — 이 점들이 그대로 흩어짐 */
+function dotsAlong(pts) {
+  const out = [];
+  let carry = 0;
+  pts.forEach((p, i) => {
+    const q = pts[(i + 1) % pts.length], len = Math.hypot(q[0] - p[0], q[1] - p[1]);
+    for (let u = carry; u < len; u += DROP.dotGap) out.push([p[0] + (q[0] - p[0]) * u / len, p[1] + (q[1] - p[1]) * u / len]);
+    carry = (carry - len) % DROP.dotGap; if (carry < 0) carry += DROP.dotGap;
+  });
+  return out;
+}
+const dot = (x, y) => { dctx.beginPath(); dctx.arc(x, y, DROP.dotSize, 0, Math.PI * 2); dctx.fill(); };
+function scatterDots(pts, cx, cy) {
+  return dotsAlong(pts).map(([x, y]) => {
+    const a = Math.atan2(y - cy, x - cx) + rand(-0.35, 0.35);
+    return { x, y, dx: Math.cos(a), dy: Math.sin(a), d: rand(...DROP.spread) };
+  });
+}
+
+function drawDrop(now) {
+  dctx.clearRect(0, 0, dropW, dropH);
+  const active = document.body.dataset.screen === 'home' && !document.fullscreenElement;
+  if (!active) { bubble = null; dropHit.hidden = true; return; }
+  if (dropCv.clientWidth !== dropW || dropCv.clientHeight !== dropH) sizeDrops();   // 처음 보일 때, 창 크기가 바뀔 때
+  if (!bubble) spawnDrop(now);
+  if (pausedAt !== null) now = pausedAt;   // 설명이 열려 있는 동안은 물방울이 그 자리에 멈춤
+  lastDrawn = now;
+  const t = (now - bubble.t0) / 1000, D = DROP, tMove = Math.min(t, D.move);
+  const f = tMove * 60, i0 = Math.min(Math.floor(f), bubble.path.length - 1), i1 = Math.min(i0 + 1, bubble.path.length - 1), k = f - i0;
+  const cx = bubble.path[i0][0] + (bubble.path[i1][0] - bubble.path[i0][0]) * k, cy = bubble.path[i0][1] + (bubble.path[i1][1] - bubble.path[i0][1]) * k;
+  const tScatter = t - D.move - D.hold;
+  dctx.fillStyle = dctx.strokeStyle = '#1d2326';
+  if (tScatter < 0) {
+    const pts = outline(bubble, cx, cy, tMove);
+    dctx.globalAlpha = Math.min(1, t / D.appear);
+    dotsAlong(pts).forEach(([x, y]) => dot(x, y));
+    bubble.last = pts;
+  } else if (tScatter < D.scatter) {
+    if (!bubble.dots) bubble.dots = scatterDots(bubble.last, cx, cy);
+    const u = tScatter / D.scatter, m = 1 - Math.pow(1 - u, 3);   // 처음엔 빠르게, 점점 느려지며
+    dctx.globalAlpha = 1 - u;
+    bubble.dots.forEach(p => dot(p.x + p.dx * p.d * m, p.y + p.dy * p.d * m));
+  } else if (tScatter > D.scatter + D.rest) bubble = null;
+  dctx.globalAlpha = 1;
+  /* 누를 수 있는 자리 — 흩어지기 시작하면 더는 누를 수 없음 */
+  const box = dropCv.getBoundingClientRect(), hit = bubble && tScatter < 0;
+  dropHit.hidden = !hit;
+  const hr = 22;   // 작은 물방울도 누르기 쉽게 누르는 자리는 넉넉히
+  if (hit) Object.assign(dropHit.style, { left: `${box.left + cx - hr}px`, top: `${box.top + cy - hr}px`, width: `${hr * 2}px`, height: `${hr * 2}px` });
+}
+(function dropLoop(now) { drawDrop(now); requestAnimationFrame(dropLoop); })(performance.now());
+
+/* 설명은 물방울 바로 옆에 — 오른쪽에 자리가 없으면 왼쪽, 위아래는 화면 안으로 */
+let pausedAt = null, lastDrawn = 0;   // 마지막으로 그린 순간 — 누른 그 모습 그대로 멈추게
+function openAbout() {
+  const r = dropHit.getBoundingClientRect(), card = about.querySelector('.card');
+  about.hidden = false;
+  const w = card.offsetWidth, h = card.offsetHeight, cx = r.left + r.width / 2, gap = 18;   // 물방울 가운데에서 이만큼 떨어져
+  let left = cx + gap;
+  if (left + w > innerWidth - 16) left = cx - gap - w;
+  card.style.left = `${Math.max(16, left)}px`;
+  card.style.top = `${Math.min(Math.max(48, r.top + r.height / 2 - h / 2), innerHeight - h - 16)}px`;
+  pausedAt = lastDrawn; card.focus();
+}
+function closeAbout() {
+  about.hidden = true;
+  if (pausedAt !== null && bubble) bubble.t0 += performance.now() - pausedAt;   // 멈춰 있던 만큼 미룸
+  pausedAt = null;
+}
+dropHit.addEventListener('click', openAbout);
+document.getElementById('aboutClose').addEventListener('click', closeAbout);
+about.addEventListener('click', e => { if (e.target === about) closeAbout(); });
+addEventListener('keydown', e => { if (e.key === 'Escape' && !about.hidden) closeAbout(); });
 
 /* ---------- 화면 — '' 홈(원본) · #make 만들기 · #mine 확정한 내 지층 ---------- */
 function route() {
@@ -564,6 +718,7 @@ function route() {
   if (s !== 'make' && s !== 'mine') s = 'home';
   document.body.dataset.screen = s;
   makeEl.hidden = s !== 'make';
+  if (s !== 'home') closeAbout();
   if (s === 'make') renderList();
   else { const want = s === 'mine' ? mine : ORIGINAL; if (set !== want) loadSet(want); }
   if (!set) loadSet(ORIGINAL);
